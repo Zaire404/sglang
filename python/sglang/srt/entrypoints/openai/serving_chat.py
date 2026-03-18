@@ -1256,7 +1256,11 @@ class OpenAIServingChat(OpenAIServingBase):
 
         # Explicit request parameter has the highest priority.
         if request.chat_template_kwargs and param_name in request.chat_template_kwargs:
-            return request.chat_template_kwargs.get(param_name) is not False
+            value = request.chat_template_kwargs.get(param_name)
+            if not parser_default:
+                # Off-by-default parsers require an explicit True signal.
+                return value is True
+            return value is not False
 
         # If omitted, use the default inferred from chat template when available.
         get_template_default = getattr(
