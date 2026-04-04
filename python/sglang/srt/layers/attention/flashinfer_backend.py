@@ -27,6 +27,10 @@ from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
 from sglang.srt.layers.attention.utils import create_flashinfer_kv_indices_triton
 from sglang.srt.layers.dp_attention import get_attention_tp_size
 from sglang.srt.layers.radix_attention import AttentionType
+from sglang.srt.layers.utils.cp_utils import (
+    build_flashinfer_cp_plan,
+    cp_allgather_and_save_kv_cache,
+)
 from sglang.srt.mem_cache.swa_memory_pool import SWATokenToKVPoolAllocator
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.speculative.spec_info import SpecInput
@@ -151,6 +155,7 @@ class FlashInferAttnBackend(AttentionBackend):
         self.skip_prefill = skip_prefill
         self.is_multimodal = model_runner.model_config.is_multimodal
         self.page_size = model_runner.page_size
+        self.attn_cp_size = model_runner.attn_cp_size
 
         assert not (
             model_runner.sliding_window_size is not None
@@ -290,6 +295,16 @@ class FlashInferAttnBackend(AttentionBackend):
                     use_tensor_cores=self.decode_use_tensor_cores,
                 )
             )
+        # Dedicated wrapper for CP prefill. It is planned at layer forward time.
+        self.prefill_wrapper_cp = (
+            BatchPrefillWithPagedKVCacheWrapper(
+                self.workspace_buffer,
+                "NHD",
+                backend=self.prefill_backend,
+            )
+            if not skip_prefill
+            else None
+        )
 
         # Create indices updater
         if not skip_prefill:
@@ -773,6 +788,76 @@ class FlashInferAttnBackend(AttentionBackend):
         )
 
         logits_soft_cap = layer.logit_cap
+
+        cp_meta = forward_batch.attn_cp_metadata
+        cp_size = (
+            len(cp_meta.per_rank_actual_token)
+            if cp_meta is not None and cp_meta.per_rank_actual_token is not None
+            else self.attn_cp_size
+        )
+        # In some qwen3_moe communication paths, CP metadata is present while
+        # forward_mode may transiently be non-extend. A k/cache_loc mismatch
+        # still indicates CP KV allgather is required before paged prefill.
+        should_force_cp_by_shape = (
+            cp_meta is not None
+            and save_kv_cache
+            and k is not None
+            and cache_loc is not None
+            and k.shape[0] != cache_loc.shape[0]
+        )
+        is_cp_mode = (
+            cp_meta is not None
+            and cp_size > 1
+            and (
+                forward_batch.forward_mode.is_context_parallel_extend()
+                or should_force_cp_by_shape
+            )
+        )
+        if is_cp_mode:
+            assert (
+                forward_batch.batch_size == 1
+            ), "FlashInfer CP prefill only supports bs=1 for now."
+            assert (
+                not layer.is_cross_attention
+            ), "FlashInfer CP prefill does not support cross attention."
+            assert save_kv_cache, "FlashInfer CP prefill requires save_kv_cache=True."
+            assert (
+                k is not None and v is not None
+            ), "FlashInfer CP prefill requires explicit k/v tensors."
+            assert self.prefill_wrapper_cp is not None
+
+            cp_allgather_and_save_kv_cache(forward_batch, layer, k, v, cp_size)
+            req_to_token_row = forward_batch.req_to_token_pool.req_to_token[
+                forward_batch.req_pool_indices[0]
+            ]
+            cp_plan = build_flashinfer_cp_plan(cp_meta, req_to_token_row, q.device)
+
+            q = q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim)
+            self.prefill_wrapper_cp.begin_forward(
+                cp_plan.qo_indptr,
+                cp_plan.kv_indptr,
+                cp_plan.kv_indices,
+                cp_plan.kv_last_page_len,
+                layer.tp_q_head_num,
+                layer.tp_k_head_num,
+                layer.head_dim,
+                1,
+                q_data_type=q.dtype,
+                kv_data_type=k.dtype,
+                non_blocking=True,
+            )
+            o = self.prefill_wrapper_cp.forward(
+                q,
+                forward_batch.token_to_kv_pool.get_kv_buffer(layer.layer_id),
+                causal=True,
+                sm_scale=layer.scaling,
+                window_left=layer.sliding_window_size,
+                logits_soft_cap=logits_soft_cap,
+                k_scale=layer.k_scale_float,
+                v_scale=layer.v_scale_float,
+            )
+            self.prefill_wrapper_cp.end_forward()
+            return o.view(-1, layer.tp_q_head_num * layer.head_dim)
 
         q = q.contiguous()
         if not self.forward_metadata.use_ragged:

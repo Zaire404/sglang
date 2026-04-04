@@ -31,6 +31,14 @@ class ContextParallelMetadata:
     total_seq_lens: torch.Tensor = None
 
 
+@dataclass
+class FlashInferCPPlan:
+    qo_indptr: torch.Tensor
+    kv_indptr: torch.Tensor
+    kv_indices: torch.Tensor
+    kv_last_page_len: torch.Tensor
+
+
 def is_prefill_context_parallel_enabled():
     return get_global_server_args().enable_prefill_context_parallel
 
@@ -245,6 +253,35 @@ def cp_all_gather_rerange_kv_cache(input_tensor, cp_size, forward_batch, stream)
     )
     # No need to reshape - output_tensor already has the correct shape [seq_len, ...]
     return output_tensor
+
+
+def build_flashinfer_cp_plan(
+    cp_meta: ContextParallelMetadata,
+    req_to_token_row: torch.Tensor,
+    device: torch.device | str,
+) -> FlashInferCPPlan:
+    """Build a two-segment paged prefill plan for flashinfer CP prefill."""
+    q_prev = int(cp_meta.actual_seq_q_prev)
+    q_next = int(cp_meta.actual_seq_q_next)
+    kv_prev = int(cp_meta.kv_len_prev)
+    kv_next = int(cp_meta.kv_len_next)
+
+    qo_indptr = torch.tensor(
+        [0, q_prev, q_prev + q_next], dtype=torch.int32, device=device
+    )
+    kv_indptr = torch.tensor(
+        [0, kv_prev, kv_prev + kv_next], dtype=torch.int32, device=device
+    )
+    kv_indices = torch.cat(
+        [req_to_token_row[:kv_prev], req_to_token_row[:kv_next]], dim=0
+    ).to(dtype=torch.int32, device=device)
+    kv_last_page_len = torch.ones((2,), dtype=torch.int32, device=device)
+    return FlashInferCPPlan(
+        qo_indptr=qo_indptr,
+        kv_indptr=kv_indptr,
+        kv_indices=kv_indices,
+        kv_last_page_len=kv_last_page_len,
+    )
 
 
 def cp_allgather_and_save_kv_cache(forward_batch, layer, k, v, cp_size):

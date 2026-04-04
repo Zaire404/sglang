@@ -470,6 +470,8 @@ Please consult the documentation below and [server_args.py](https://github.com/s
 | `--enable-attn-tp-input-scattered` | Allow input of attention to be scattered when only using tensor parallelism, to reduce the computational load of operations such as qkv latent. | `False` | bool flag (set to enable) |
 | `--enable-nsa-prefill-context-parallel` | Enable context parallelism used in the long sequence prefill phase of DeepSeek v3.2. | `False` | bool flag (set to enable) |
 | `--nsa-prefill-cp-mode` | Token splitting mode for the prefill phase of DeepSeek v3.2 under context parallelism. Optional values: `round-robin-split`(default),`in-seq-split`. `round-robin-split` distributes tokens across ranks based on `token_idx % cp_size`. It supports multi-batch prefill, fused MoE, and FP8 KV cache. | `in-seq-split` | `in-seq-split`, `round-robin-split` |
+| `--enable-prefill-context-parallel` | Enable context parallelism used in the prefill phase. | `False` | bool flag (set to enable) |
+| `--prefill-cp-mode` | Token splitting mode for the prefill phase under context parallelism. Optional values: `in-seq-split` (default). | `in-seq-split` | `in-seq-split` |
 | `--enable-fused-qk-norm-rope` | Enable fused qk normalization and rope rotary embedding. | `False` | bool flag (set to enable) |
 | `--enable-precise-embedding-interpolation` | Enable corner alignment for resize of embeddings grid to ensure more accurate(but slower) evaluation of interpolated embedding values. | `False` | bool flag (set to enable) |
 
